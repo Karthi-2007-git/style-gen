@@ -15,8 +15,7 @@ They internally rescale to [0, 1] where needed.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List
 
 import torch
@@ -61,7 +60,7 @@ def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> t
     mse_per_image = F.mse_loss(pred, target, reduction="none").mean(dim=[1, 2, 3])
     # Avoid log(0) when MSE is exactly zero (perfect reconstruction)
     mse_per_image = mse_per_image.clamp_min(1e-10)
-    psnr_per_image = 10.0 * torch.log10(torch.tensor(data_range ** 2) / mse_per_image)
+    psnr_per_image = 10.0 * torch.log10(mse_per_image.new_tensor(data_range**2) / mse_per_image)
     return psnr_per_image.mean()
 
 
@@ -154,24 +153,18 @@ class _FeatureExtractor(nn.Module):
 def _cov(x: torch.Tensor) -> torch.Tensor:
     """Unbiased covariance matrix for (N, D) feature matrix."""
     N, D = x.shape
+    if N < 2:
+        raise ValueError("FID requires at least two samples.")
     mean = x.mean(dim=0, keepdim=True)
     x_c  = x - mean
     return (x_c.T @ x_c) / (N - 1)
 
 
-def _matrix_sqrt(A: torch.Tensor, num_iters: int = 20) -> torch.Tensor:
-    """
-    Iterative matrix square root via Denman–Beavers (no torch.linalg.eigh needed).
-    Works for positive semi-definite matrices.
-    """
-    n = A.shape[0]
-    Y = A.clone()
-    Z = torch.eye(n, dtype=A.dtype, device=A.device)
-    for _ in range(num_iters):
-        T  = 0.5 * (Y + torch.linalg.solve(Z.T, torch.eye(n, device=A.device, dtype=A.dtype)).T)
-        Z  = 0.5 * (Z + torch.linalg.solve(Y.T, torch.eye(n, device=A.device, dtype=A.dtype)).T)
-        Y  = T
-    return Y
+def _matrix_sqrt(A: torch.Tensor) -> torch.Tensor:
+    """Symmetric matrix square root for positive semi-definite matrices."""
+    eigenvalues, eigenvectors = torch.linalg.eigh(A)
+    clipped = eigenvalues.clamp_min(0.0).sqrt()
+    return (eigenvectors * clipped.unsqueeze(0)) @ eigenvectors.T
 
 
 class FIDTracker:
@@ -344,10 +337,14 @@ class MetricsTracker:
             self._cer.update(pred_texts, target_texts)
 
     def compute(self) -> MetricsSummary:
+        try:
+            fid_value = self._fid.compute()
+        except (RuntimeError, ValueError):
+            fid_value = float("nan")
         return MetricsSummary(
             psnr=sum(self._psnr_vals) / max(len(self._psnr_vals), 1),
             ssim=sum(self._ssim_vals) / max(len(self._ssim_vals), 1),
-            fid=self._fid.compute(),
+            fid=fid_value,
             cer=self._cer.compute(),
         )
 

@@ -1,389 +1,494 @@
-"""
-metrics.py — Evaluation metrics for style_gen.
-
-Metrics
-───────
-  PSNR     — pixel-level fidelity (higher = better)
-  SSIM     — structural similarity (higher = better, max 1.0)
-  FID      — Fréchet Inception Distance on CNN features (lower = better)
-  CER      — Character Error Rate via a lightweight CNN-CTC decoder (lower = better)
-  MetricsTracker — accumulates all four over a full eval loop
-
-All functions operate on float tensors normalised to [-1, 1]  (as your dataset outputs).
-They internally rescale to [0, 1] where needed.
-"""
+"""Training entrypoint for the style_gen diffusion pipeline."""
 
 from __future__ import annotations
 
+import argparse
+import json
 import math
-from dataclasses import dataclass, field
-from typing import Dict, List
+import random
+import sys
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from diffusers import DDPMScheduler
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from tqdm.auto import tqdm
 
-__all__ = [
-    "psnr",
-    "ssim",
-    "FIDTracker",
-    "CERTracker",
-    "MetricsTracker",
-    "MetricsSummary",
-]
+from models.dataset import get_dataloader
+from models.generator import StyleTextGenerator
+from models.style_encoder import Style_Encoder
+from models.text_encoder import PAD_TOKEN, Transformer_Text_Encoder, build_vocab
+from utils import resize_for_style_encoder
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _to_01(x: torch.Tensor) -> torch.Tensor:
-    """Rescale from [-1, 1] → [0, 1]."""
-    return (x.clamp(-1.0, 1.0) + 1.0) / 2.0
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. PSNR
-# ──────────────────────────────────────────────────────────────────────────────
-
-def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> torch.Tensor:
-    """
-    Peak Signal-to-Noise Ratio, averaged over the batch.
-
-    Args:
-        pred   (B, 1, H, W) : generated images, range [-1, 1]
-        target (B, 1, H, W) : ground-truth images, range [-1, 1]
-    Returns:
-        scalar tensor — mean PSNR in dB
-    """
-    pred   = _to_01(pred)
-    target = _to_01(target)
-    mse_per_image = F.mse_loss(pred, target, reduction="none").mean(dim=[1, 2, 3])
-    # Avoid log(0) when MSE is exactly zero (perfect reconstruction)
-    mse_per_image = mse_per_image.clamp_min(1e-10)
-    psnr_per_image = 10.0 * torch.log10(torch.tensor(data_range ** 2) / mse_per_image)
-    return psnr_per_image.mean()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. SSIM
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _gaussian_kernel(window_size: int = 11, sigma: float = 1.5) -> torch.Tensor:
-    """1D Gaussian → outer product → 2D kernel (window_size, window_size)."""
-    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
-    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-    g /= g.sum()
-    return g.outer(g)
-
-
-def ssim(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    window_size: int = 11,
-    C1: float = 0.01 ** 2,
-    C2: float = 0.03 ** 2,
-) -> torch.Tensor:
-    """
-    Structural Similarity Index, averaged over the batch.
-
-    Args:
-        pred   (B, 1, H, W) : generated images, range [-1, 1]
-        target (B, 1, H, W) : ground-truth images, range [-1, 1]
-    Returns:
-        scalar tensor in (-1, 1]; higher = more similar
-    """
-    pred   = _to_01(pred)
-    target = _to_01(target)
-
-    B, C, H, W = pred.shape
-    kernel = _gaussian_kernel(window_size).to(pred.device)
-    kernel = kernel.unsqueeze(0).unsqueeze(0).expand(C, 1, -1, -1)
-    pad    = window_size // 2
-
-    mu_p  = F.conv2d(pred,   kernel, padding=pad, groups=C)
-    mu_t  = F.conv2d(target, kernel, padding=pad, groups=C)
-    mu_p2 = mu_p  * mu_p
-    mu_t2 = mu_t  * mu_t
-    mu_pt = mu_p  * mu_t
-
-    sigma_p2  = F.conv2d(pred   * pred,   kernel, padding=pad, groups=C) - mu_p2
-    sigma_t2  = F.conv2d(target * target, kernel, padding=pad, groups=C) - mu_t2
-    sigma_pt  = F.conv2d(pred   * target, kernel, padding=pad, groups=C) - mu_pt
-
-    numerator   = (2 * mu_pt + C1) * (2 * sigma_pt + C2)
-    denominator = (mu_p2 + mu_t2 + C1) * (sigma_p2 + sigma_t2 + C2)
-
-    ssim_map = numerator / denominator.clamp_min(1e-8)
-    return ssim_map.mean()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. FID  (Fréchet distance on lightweight CNN features)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class _FeatureExtractor(nn.Module):
-    """
-    Small ConvNet that maps (B, 1, H, W) → (B, 512) feature vectors.
-    Shares the same architecture as the CNN branch of Style_Encoder so the
-    feature space is meaningful for handwriting.
-    """
-    def __init__(self, feat_dim: int = 512):
-        super().__init__()
-        self.net = nn.Sequential(
-            # 128×512 → 64×256
-            nn.Conv2d(1, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.SiLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.SiLU(),
-            nn.MaxPool2d(2),
-            # 64×256 → 32×128
-            nn.Conv2d(64, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.SiLU(),
-            nn.Conv2d(128, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.SiLU(),
-            nn.MaxPool2d(2),
-            # 32×128 → 4×4 (adaptive)
-            nn.Conv2d(128, 256, 3, padding=1), nn.GroupNorm(8, 256), nn.SiLU(),
-            nn.AdaptiveAvgPool2d(4),
-            nn.Flatten(),
-            nn.Linear(256 * 4 * 4, feat_dim),
-            nn.LayerNorm(feat_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(_to_01(x))
-
-
-def _cov(x: torch.Tensor) -> torch.Tensor:
-    """Unbiased covariance matrix for (N, D) feature matrix."""
-    N, D = x.shape
-    mean = x.mean(dim=0, keepdim=True)
-    x_c  = x - mean
-    return (x_c.T @ x_c) / (N - 1)
-
-
-def _matrix_sqrt(A: torch.Tensor, num_iters: int = 20) -> torch.Tensor:
-    """
-    Iterative matrix square root via Denman–Beavers (no torch.linalg.eigh needed).
-    Works for positive semi-definite matrices.
-    """
-    n = A.shape[0]
-    Y = A.clone()
-    Z = torch.eye(n, dtype=A.dtype, device=A.device)
-    for _ in range(num_iters):
-        T  = 0.5 * (Y + torch.linalg.solve(Z.T, torch.eye(n, device=A.device, dtype=A.dtype)).T)
-        Z  = 0.5 * (Z + torch.linalg.solve(Y.T, torch.eye(n, device=A.device, dtype=A.dtype)).T)
-        Y  = T
-    return Y
-
-
-class FIDTracker:
-    """
-    Accumulates feature vectors for real and generated images,
-    then computes the Fréchet distance on request.
-
-    Usage::
-
-        fid = FIDTracker(device=device)
-        for real, fake in eval_batches:
-            fid.update(real_images=real, fake_images=fake)
-        score = fid.compute()   # lower = better
-        fid.reset()
-    """
-
-    def __init__(self, feat_dim: int = 512, device: torch.device | str = "cpu"):
-        self.extractor = _FeatureExtractor(feat_dim).to(device).eval()
-        self.device    = device
-        self._real: List[torch.Tensor] = []
-        self._fake: List[torch.Tensor] = []
-
-    @torch.no_grad()
-    def update(self, real_images: torch.Tensor, fake_images: torch.Tensor) -> None:
-        self._real.append(self.extractor(real_images.to(self.device)).cpu())
-        self._fake.append(self.extractor(fake_images.to(self.device)).cpu())
-
-    def compute(self) -> float:
-        if not self._real:
-            raise RuntimeError("No data accumulated — call .update() first.")
-        real = torch.cat(self._real, dim=0).double()   # (N, D)
-        fake = torch.cat(self._fake, dim=0).double()
-
-        mu_r, mu_f   = real.mean(0), fake.mean(0)
-        cov_r, cov_f = _cov(real),   _cov(fake)
-
-        diff      = mu_r - mu_f
-        covmean   = _matrix_sqrt(cov_r @ cov_f)
-
-        # FID = ||μ_r - μ_f||² + Tr(Σ_r + Σ_f - 2√(Σ_r Σ_f))
-        trace_term = (cov_r + cov_f - 2.0 * covmean).diagonal().sum()
-        fid_score  = (diff @ diff + trace_term).item()
-        return max(fid_score, 0.0)         # numerical guard against tiny negatives
-
-    def reset(self) -> None:
-        self._real.clear()
-        self._fake.clear()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. CER  (Character Error Rate — edit distance on predicted vs true text)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _edit_distance(s1: str, s2: str) -> int:
-    """Standard dynamic-programming Levenshtein distance."""
-    m, n = len(s1), len(s2)
-    dp = list(range(n + 1))
-    for i in range(1, m + 1):
-        prev = dp[0]
-        dp[0] = i
-        for j in range(1, n + 1):
-            temp  = dp[j]
-            dp[j] = prev if s1[i - 1] == s2[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
-            prev  = temp
-    return dp[n]
-
-
-class CERTracker:
-    """
-    Accumulates (predicted_text, ground_truth_text) pairs and computes CER.
-
-    CER = total_edit_distance / total_ground_truth_characters
-
-    Usage::
-
-        cer = CERTracker()
-        cer.update(predictions=["helo", "wrold"], targets=["hello", "world"])
-        print(cer.compute())   # 0.2
-        cer.reset()
-    """
-
-    def __init__(self) -> None:
-        self._total_edits: int = 0
-        self._total_chars: int = 0
-
-    def update(self, predictions: List[str], targets: List[str]) -> None:
-        if len(predictions) != len(targets):
-            raise ValueError("predictions and targets must have the same length.")
-        for pred, tgt in zip(predictions, targets):
-            self._total_edits += _edit_distance(pred, tgt)
-            self._total_chars += len(tgt)
-
-    def compute(self) -> float:
-        if self._total_chars == 0:
-            return 0.0
-        return self._total_edits / self._total_chars
-
-    def reset(self) -> None:
-        self._total_edits = 0
-        self._total_chars = 0
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. MetricsTracker — convenience wrapper over all four metrics
-# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class MetricsSummary:
-    psnr: float = 0.0
-    ssim: float = 0.0
-    fid:  float = 0.0
-    cer:  float = 0.0
+class TrainConfig:
+    train_split: str = "train"
+    val_split: str = "validation"
+    batch_size: int = 4
+    val_batch_size: int = 4
+    grad_accum_steps: int = 1
+    max_len: int = 256
+    epochs: int = 10
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    grad_clip_norm: float = 1.0
+    warmup_steps: int = 500
+    min_lr_scale: float = 0.1
+    num_train_timesteps: int = 1000
+    num_workers: int = 0
+    fallback_writer_group_size: int = 20
+    mixed_precision: bool = True
+    enable_gradient_checkpointing: bool = True
+    enable_attention_slicing: bool = True
+    log_every: int = 25
+    save_every: int = 1
+    output_dir: str = "training/checkpoints"
+    resume_from: str | None = None
+    seed: int = 42
+    device: str | None = None
+    cache_dir: str | None = None
+    text_dim: int = 256
+    style_dim: int = 512
+    fusion_dim: int = 256
 
-    def __str__(self) -> str:
-        return (
-            f"PSNR={self.psnr:.2f} dB  |  "
-            f"SSIM={self.ssim:.4f}  |  "
-            f"FID={self.fid:.2f}  |  "
-            f"CER={self.cer:.4f}"
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device: str | None) -> torch.device:
+    if device:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def unpack_batch(batch: Any, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if isinstance(batch, dict):
+        images = batch["image"].to(device, non_blocking=True)
+        tokens = batch["tokens"].to(device, non_blocking=True)
+        style_images = batch.get("style_image")
+        if style_images is None:
+            style_images = resize_for_style_encoder(images)
+        else:
+            style_images = style_images.to(device, non_blocking=True)
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) < 2:
+            raise ValueError("Expected at least image and token tensors in the batch.")
+        images = batch[0].to(device, non_blocking=True)
+        tokens = batch[1].to(device, non_blocking=True)
+        if len(batch) >= 4 and torch.is_tensor(batch[3]):
+            style_images = batch[3].to(device, non_blocking=True)
+        else:
+            style_images = resize_for_style_encoder(images)
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch)!r}")
+
+    if style_images.shape[-2:] != (64, 256):
+        style_images = resize_for_style_encoder(style_images)
+    return images, tokens, style_images
+
+
+def compute_diffusion_loss(
+    batch: Any,
+    style_encoder: Style_Encoder,
+    text_encoder: Transformer_Text_Encoder,
+    generator: StyleTextGenerator,
+    noise_scheduler: DDPMScheduler,
+    device: torch.device,
+    use_amp: bool,
+) -> torch.Tensor:
+    images, tokens, style_images = unpack_batch(batch, device)
+    batch_size = images.shape[0]
+    noise = torch.randn_like(images)
+    timesteps = torch.randint(
+        low=0,
+        high=noise_scheduler.config.num_train_timesteps,
+        size=(batch_size,),
+        device=device,
+        dtype=torch.long,
+    )
+
+    noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+
+    with autocast_context(device, use_amp):
+        style_emb = style_encoder(style_images)
+        text_emb = text_encoder(tokens)
+        noise_pred = generator(noisy_images, timesteps, style_emb, text_emb)
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+    return loss
+
+
+def build_lr_scheduler(optimizer: AdamW, total_steps: int, warmup_steps: int, min_lr_scale: float) -> LambdaLR:
+    def lr_lambda(step: int) -> float:
+        if total_steps <= 0:
+            return 1.0
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step + 1, 1) / warmup_steps
+
+        cosine_steps = max(total_steps - warmup_steps, 1)
+        progress = min(max(step - warmup_steps, 0) / cosine_steps, 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def configure_generator_for_memory(generator: StyleTextGenerator, config: TrainConfig) -> None:
+    if config.enable_gradient_checkpointing and hasattr(generator.unet, "enable_gradient_checkpointing"):
+        generator.unet.enable_gradient_checkpointing()
+    if config.enable_attention_slicing and hasattr(generator.unet, "set_attention_slice"):
+        generator.unet.set_attention_slice("auto")
+
+
+@torch.no_grad()
+def run_validation(
+    dataloader: Any,
+    style_encoder: Style_Encoder,
+    text_encoder: Transformer_Text_Encoder,
+    generator: StyleTextGenerator,
+    noise_scheduler: DDPMScheduler,
+    device: torch.device,
+    use_amp: bool,
+) -> float:
+    style_encoder.eval()
+    text_encoder.eval()
+    generator.eval()
+
+    losses = []
+    for batch in tqdm(dataloader, desc="Validation", leave=False):
+        loss = compute_diffusion_loss(
+            batch=batch,
+            style_encoder=style_encoder,
+            text_encoder=text_encoder,
+            generator=generator,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            use_amp=use_amp,
+        )
+        losses.append(loss.item())
+
+    style_encoder.train()
+    text_encoder.train()
+    generator.train()
+    return sum(losses) / max(len(losses), 1)
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    config: TrainConfig,
+    epoch: int,
+    global_step: int,
+    best_val_loss: float,
+    style_encoder: Style_Encoder,
+    text_encoder: Transformer_Text_Encoder,
+    generator: StyleTextGenerator,
+    optimizer: AdamW,
+    lr_scheduler: LambdaLR,
+    scaler: torch.cuda.amp.GradScaler,
+    char2idx: dict[str, int],
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "config": asdict(config),
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": best_val_loss,
+            "char2idx": char2idx,
+            "style_encoder": style_encoder.state_dict(),
+            "text_encoder": text_encoder.state_dict(),
+            "generator": generator.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    device: torch.device,
+    style_encoder: Style_Encoder,
+    text_encoder: Transformer_Text_Encoder,
+    generator: StyleTextGenerator,
+    optimizer: AdamW,
+    lr_scheduler: LambdaLR,
+    scaler: torch.cuda.amp.GradScaler,
+) -> tuple[int, int, float]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    style_encoder.load_state_dict(checkpoint["style_encoder"])
+    text_encoder.load_state_dict(checkpoint["text_encoder"])
+    generator.load_state_dict(checkpoint["generator"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    if "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
+
+    start_epoch = int(checkpoint.get("epoch", -1)) + 1
+    global_step = int(checkpoint.get("global_step", 0))
+    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+    return start_epoch, global_step, best_val_loss
+
+
+def train(config: TrainConfig | None = None) -> dict[str, float]:
+    config = config or TrainConfig()
+    seed_everything(config.seed)
+    device = resolve_device(config.device)
+    use_amp = config.mixed_precision and device.type == "cuda"
+
+    char2idx, _ = build_vocab()
+    pad_idx = char2idx[PAD_TOKEN]
+    vocab_size = len(char2idx)
+
+    train_loader = get_dataloader(
+        split=config.train_split,
+        batch_size=config.batch_size,
+        shuffle=True,
+        max_len=config.max_len,
+        num_workers=config.num_workers,
+        cache_dir=config.cache_dir,
+        drop_last=True,
+        fallback_writer_group_size=config.fallback_writer_group_size,
+    )
+    val_loader = get_dataloader(
+        split=config.val_split,
+        batch_size=config.val_batch_size,
+        shuffle=False,
+        max_len=config.max_len,
+        num_workers=config.num_workers,
+        cache_dir=config.cache_dir,
+        drop_last=False,
+        fallback_writer_group_size=config.fallback_writer_group_size,
+    )
+
+    style_encoder = Style_Encoder(output_dim=config.style_dim).to(device)
+    text_encoder = Transformer_Text_Encoder(
+        vocab_size=vocab_size,
+        embed_dim=config.text_dim,
+        max_len=config.max_len,
+        pad_idx=pad_idx,
+    ).to(device)
+    generator = StyleTextGenerator(
+        style_dim=config.style_dim,
+        text_dim=config.text_dim,
+        fusion_dim=config.fusion_dim,
+    ).to(device)
+
+    noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps)
+    optimizer = AdamW(
+        list(style_encoder.parameters())
+        + list(text_encoder.parameters())
+        + list(generator.parameters()),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+    configure_generator_for_memory(generator, config)
+
+    total_steps = math.ceil(max(len(train_loader), 1) / max(config.grad_accum_steps, 1)) * config.epochs
+    lr_scheduler = build_lr_scheduler(
+        optimizer=optimizer,
+        total_steps=total_steps,
+        warmup_steps=config.warmup_steps,
+        min_lr_scale=config.min_lr_scale,
+    )
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "train_config.json").write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+
+    start_epoch = 0
+    global_step = 0
+    best_val_loss = float("inf")
+    if config.resume_from:
+        start_epoch, global_step, best_val_loss = load_checkpoint(
+            checkpoint_path=config.resume_from,
+            device=device,
+            style_encoder=style_encoder,
+            text_encoder=text_encoder,
+            generator=generator,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            scaler=scaler,
         )
 
+    history: list[dict[str, float]] = []
+    print(f"Training on {device} with {vocab_size} text tokens")
 
-class MetricsTracker:
-    """
-    Unified tracker — accumulates over an entire eval loop then summarises.
+    for epoch in range(start_epoch, config.epochs):
+        style_encoder.train()
+        text_encoder.train()
+        generator.train()
 
-    Usage (inside your eval loop)::
+        running_loss = 0.0
+        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, batch in enumerate(progress, start=1):
+            loss = compute_diffusion_loss(
+                batch=batch,
+                style_encoder=style_encoder,
+                text_encoder=text_encoder,
+                generator=generator,
+                noise_scheduler=noise_scheduler,
+                device=device,
+                use_amp=use_amp,
+            )
+            running_loss += loss.item()
 
-        tracker = MetricsTracker(device=device)
+            scaled_loss = loss / max(config.grad_accum_steps, 1)
+            scaler.scale(scaled_loss).backward()
 
-        for real_images, tokens, _ in val_loader:
-            fake_images = generate(...)        # your sampling function
-            pred_texts  = ocr_decode(...)      # optional — pass [] to skip CER
+            should_step = (
+                batch_index % max(config.grad_accum_steps, 1) == 0
+                or batch_index == len(train_loader)
+            )
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    list(style_encoder.parameters())
+                    + list(text_encoder.parameters())
+                    + list(generator.parameters()),
+                    max_norm=config.grad_clip_norm,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
 
-            tracker.update(
-                real_images=real_images,
-                fake_images=fake_images,
-                pred_texts=pred_texts,          # list[str] or []
-                target_texts=target_texts,      # list[str] or []
+            global_step += 1
+
+            if batch_index % config.log_every == 0 or batch_index == len(train_loader):
+                avg_loss = running_loss / batch_index
+                current_lr = optimizer.param_groups[0]["lr"]
+                progress.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{current_lr:.2e}")
+
+        train_loss = running_loss / max(len(train_loader), 1)
+        val_loss = run_validation(
+            dataloader=val_loader,
+            style_encoder=style_encoder,
+            text_encoder=text_encoder,
+            generator=generator,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            use_amp=use_amp,
+        )
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(
+                checkpoint_path=output_dir / "style_gen_best.pt",
+                config=config,
+                epoch=epoch,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                style_encoder=style_encoder,
+                text_encoder=text_encoder,
+                generator=generator,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+                char2idx=char2idx,
             )
 
-        summary = tracker.compute()
-        print(summary)
-        tracker.reset()
-    """
+        if (epoch + 1) % config.save_every == 0:
+            save_checkpoint(
+                checkpoint_path=output_dir / f"style_gen_epoch_{epoch + 1:03d}.pt",
+                config=config,
+                epoch=epoch,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                style_encoder=style_encoder,
+                text_encoder=text_encoder,
+                generator=generator,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                scaler=scaler,
+                char2idx=char2idx,
+            )
 
-    def __init__(self, device: torch.device | str = "cpu", feat_dim: int = 512) -> None:
-        self.device      = device
-        self._fid        = FIDTracker(feat_dim=feat_dim, device=device)
-        self._cer        = CERTracker()
-        self._psnr_vals: List[float] = []
-        self._ssim_vals: List[float] = []
-
-    @torch.no_grad()
-    def update(
-        self,
-        real_images:   torch.Tensor,
-        fake_images:   torch.Tensor,
-        pred_texts:    List[str] | None = None,
-        target_texts:  List[str] | None = None,
-    ) -> None:
-        real_images = real_images.to(self.device)
-        fake_images = fake_images.to(self.device)
-
-        self._psnr_vals.append(psnr(fake_images, real_images).item())
-        self._ssim_vals.append(ssim(fake_images, real_images).item())
-        self._fid.update(real_images, fake_images)
-
-        if pred_texts and target_texts:
-            self._cer.update(pred_texts, target_texts)
-
-    def compute(self) -> MetricsSummary:
-        return MetricsSummary(
-            psnr=sum(self._psnr_vals) / max(len(self._psnr_vals), 1),
-            ssim=sum(self._ssim_vals) / max(len(self._ssim_vals), 1),
-            fid=self._fid.compute(),
-            cer=self._cer.compute(),
+        print(
+            f"Epoch {epoch + 1}/{config.epochs} | "
+            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | best_val_loss={best_val_loss:.4f}"
         )
 
-    def reset(self) -> None:
-        self._psnr_vals.clear()
-        self._ssim_vals.clear()
-        self._fid.reset()
-        self._cer.reset()
+    save_checkpoint(
+        checkpoint_path=output_dir / "style_gen_final.pt",
+        config=config,
+        epoch=config.epochs - 1,
+        global_step=global_step,
+        best_val_loss=best_val_loss,
+        style_encoder=style_encoder,
+        text_encoder=text_encoder,
+        generator=generator,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        scaler=scaler,
+        char2idx=char2idx,
+    )
+    (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+    return {
+        "train_loss": history[-1]["train_loss"] if history else float("nan"),
+        "val_loss": history[-1]["val_loss"] if history else float("nan"),
+        "best_val_loss": best_val_loss,
+    }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Quick smoke-test
-# ──────────────────────────────────────────────────────────────────────────────
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="Train the style_gen handwriting diffusion model.")
+    parser.add_argument("--epochs", type=int, default=TrainConfig.epochs)
+    parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
+    parser.add_argument("--val-batch-size", type=int, default=TrainConfig.val_batch_size)
+    parser.add_argument("--grad-accum-steps", type=int, default=TrainConfig.grad_accum_steps)
+    parser.add_argument("--learning-rate", type=float, default=TrainConfig.learning_rate)
+    parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
+    parser.add_argument("--output-dir", type=str, default=TrainConfig.output_dir)
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--cache-dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=TrainConfig.seed)
+    parser.add_argument("--fallback-writer-group-size", type=int, default=TrainConfig.fallback_writer_group_size)
+    args = parser.parse_args()
+
+    return TrainConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        val_batch_size=args.val_batch_size,
+        grad_accum_steps=args.grad_accum_steps,
+        learning_rate=args.learning_rate,
+        num_workers=args.num_workers,
+        output_dir=args.output_dir,
+        resume_from=args.resume_from,
+        device=args.device,
+        cache_dir=args.cache_dir,
+        seed=args.seed,
+        fallback_writer_group_size=args.fallback_writer_group_size,
+    )
+
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B = 4
-    real = torch.randn(B, 1, 128, 512).to(device)
-    fake = real + 0.1 * torch.randn_like(real)         # slightly noisy clone
-
-    # Individual metrics
-    print(f"PSNR : {psnr(fake, real).item():.2f} dB")
-    print(f"SSIM : {ssim(fake, real).item():.4f}")
-
-    # FID
-    fid_tracker = FIDTracker(device=device)
-    fid_tracker.update(real, fake)
-    print(f"FID  : {fid_tracker.compute():.4f}")
-
-    # CER
-    cer_tracker = CERTracker()
-    cer_tracker.update(["helo world", "writng"], ["hello world", "writing"])
-    print(f"CER  : {cer_tracker.compute():.4f}")
-
-    # All-in-one
-    tracker = MetricsTracker(device=device)
-    tracker.update(real, fake, ["helo"], ["hello"])
-    summary = tracker.compute()
-    print(f"\nSummary: {summary}")
+    train(parse_args())
